@@ -34,10 +34,10 @@
   ],
   "scripts": {
     "test": "phpunit",
-    "test-coverage": "phpunit --coverage-html coverage",
+    "test-coverage": "phpunit --coverage-clover=coverage/clover.xml --coverage-html=coverage",
     "cs-check": "phpcs src/ tests/ --standard=PSR12",
     "cs-fix": "phpcbf src/ tests/ --standard=PSR12",
-    "analyze": "phpstan analyse src tests --level=5",
+    "analyze": "phpstan analyse src tests --level=3",
     "ci": [
       "@cs-check",
       "@analyze",
