@@ -1,0 +1,29 @@
+# Dependencies
+/vendor/
+composer.lock
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PHP CS Fixer
+/.php-cs-fixer.cache
+
+# PHPUnit
+/.phpunit.cache
+/.phpunit.result.cache
+
+# Symfony
+/var/
+/public/bundles/
+/public/build/
+
+# Coverage reports
+/coverage/
+clover.xml

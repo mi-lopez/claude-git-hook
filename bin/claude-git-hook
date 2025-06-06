@@ -1,0 +1,401 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * Claude Git Hook CLI
+ * Command line interface for managing the Claude git hook
+ */
+
+// Find the correct autoload.php file
+$autoloadPaths = [
+    // When the binary is in vendor/bin/ (normal Composer installation)
+    __DIR__ . '/../../autoload.php',
+    // When installed as a dependency
+    __DIR__ . '/../../../autoload.php',
+    // When developing the package locally
+    __DIR__ . '/../vendor/autoload.php',
+    // Current working directory (fallback)
+    getcwd() . '/vendor/autoload.php',
+    // Parent directories (search upwards)
+    dirname(getcwd()) . '/vendor/autoload.php',
+    dirname(dirname(getcwd())) . '/vendor/autoload.php',
+];
+
+$autoloadFound = false;
+foreach ($autoloadPaths as $autoloadPath) {
+    if (file_exists($autoloadPath)) {
+        require_once $autoloadPath;
+        $autoloadFound = true;
+        break;
+    }
+}
+
+if (!$autoloadFound) {
+    echo "❌ Error: Could not find Composer autoload file.\n";
+    echo "Searched in the following locations:\n";
+    foreach ($autoloadPaths as $path) {
+        echo "  - $path\n";
+    }
+    echo "\nCurrent working directory: " . getcwd() . "\n";
+    echo "Script location: " . __DIR__ . "\n";
+    echo "\nMake sure you've run 'composer install' in your project.\n";
+    echo "Try running this command from your project root directory.\n";
+    exit(1);
+}
+
+function simpleInstall()
+{
+    echo "🚀 Installing Claude Git Hook...\n";
+
+    // Check if in git repository
+    if (!is_dir('.git')) {
+        echo "❌ Not in a git repository\n";
+        echo "Please run this command from the root of your git repository\n";
+        return false;
+    }
+
+    // Create hooks directory
+    $hooksDir = '.git/hooks';
+    if (!is_dir($hooksDir)) {
+        mkdir($hooksDir, 0755, true);
+    }
+
+    // Hook content
+    $hookContent = <<<'HOOK'
+#!/bin/bash
+
+# Git hook: prepare-commit-msg
+# Generates commit messages using Claude API
+
+# Configuration
+CLAUDE_API_KEY="${CLAUDE_API_KEY:-}"
+CLAUDE_API_URL="https://api.anthropic.com/v1/messages"
+MODEL="claude-sonnet-4-20250514"
+
+# Check if API key exists
+if [ -z "$CLAUDE_API_KEY" ]; then
+    echo "Error: CLAUDE_API_KEY is not configured"
+    echo "Set it with: export CLAUDE_API_KEY='your-key-here'"
+    exit 1
+fi
+
+# Get diff of staged changes
+DIFF=$(git diff --cached --no-color)
+
+# If no staged changes, exit
+if [ -z "$DIFF" ]; then
+    echo "No staged changes for commit"
+    exit 0
+fi
+
+# Function to call Claude API
+call_claude_api() {
+    local diff_content="$1"
+    
+    # Create prompt for Claude
+    local prompt="Analyze the following code changes and generate a concise and descriptive commit message. The message should:
+
+1. Use conventional format: type(scope): description
+2. Valid types: feat, fix, docs, style, refactor, test, chore
+3. Be clear and specific about what changed
+4. Maximum 50 characters for the first line
+5. If needed, add a more detailed description after a blank line
+
+Changes to analyze:
+\`\`\`diff
+$diff_content
+\`\`\`
+
+Respond ONLY with the commit message, no additional explanations."
+
+# Escape the content properly for JSON
+local escaped_prompt=$(echo "$prompt" | python3 -c "
+import sys, json
+content = sys.stdin.read()
+print(json.dumps(content), end='')
+")
+
+# Create JSON payload using python to ensure proper escaping
+local json_payload=$(python3 -c "
+import json
+import sys
+
+prompt = '''$prompt'''
+payload = {
+    'model': '$MODEL',
+    'max_tokens': 200,
+    'messages': [
+        {
+            'role': 'user',
+            'content': prompt
+        }
+    ]
+}
+print(json.dumps(payload))
+")
+
+    # Make API call
+    local response=$(curl -s -X POST "$CLAUDE_API_URL" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $CLAUDE_API_KEY" \
+        -H "anthropic-version: 2023-06-01" \
+        -d "$json_payload")
+
+    # Extract content from response
+    echo "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if 'content' in data and len(data['content']) > 0:
+        print(data['content'][0]['text'].strip())
+    else:
+        print('Error: Invalid API response')
+        sys.exit(1)
+except Exception as e:
+    print(f'Error processing response: {e}')
+    sys.exit(1)
+"
+}
+
+# Fallback function to generate basic message
+generate_fallback_message() {
+    local diff_content="$1"
+    
+    # Basic diff analysis
+    local files_changed=$(echo "$diff_content" | grep "^diff --git" | wc -l)
+    local additions=$(echo "$diff_content" | grep "^+" | grep -v "^+++" | wc -l)
+    local deletions=$(echo "$diff_content" | grep "^-" | grep -v "^---" | wc -l)
+    
+    # Detect change type
+    if echo "$diff_content" | grep -q "\.md$\|\.txt$\|README"; then
+        echo "docs: update documentation ($files_changed files)"
+    elif echo "$diff_content" | grep -q "test\|spec"; then
+        echo "test: update tests ($additions+ $deletions-)"
+    elif [ "$deletions" -gt "$additions" ]; then
+        echo "refactor: refactor code ($files_changed files)"
+    else
+        echo "feat: implement new features ($files_changed files)"
+    fi
+}
+
+echo "🔍 Analyzing changes with Claude..."
+
+# Try to generate message with Claude
+COMMIT_MESSAGE=$(call_claude_api "$DIFF")
+EXIT_CODE=$?
+
+# If API fails, use fallback message
+if [ $EXIT_CODE -ne 0 ] || [ -z "$COMMIT_MESSAGE" ] || [[ "$COMMIT_MESSAGE" == *"Error"* ]]; then
+    echo "⚠️  Claude API unavailable, generating basic message..."
+    COMMIT_MESSAGE=$(generate_fallback_message "$DIFF")
+fi
+
+# Write message to commit file
+echo "$COMMIT_MESSAGE" > "$1"
+
+echo "✅ Commit message generated:"
+echo "   $COMMIT_MESSAGE"
+HOOK;
+
+    // Create hook file
+    $hookFile = $hooksDir . '/prepare-commit-msg';
+    file_put_contents($hookFile, $hookContent);
+    chmod($hookFile, 0755);
+
+    echo "✅ Claude Git Hook installed successfully!\n";
+    echo "📁 Hook location: $hookFile\n";
+
+    return true;
+}
+
+function simpleConfigure()
+{
+    echo "🔧 Configuring Claude Git Hook...\n";
+    echo "Enter your Claude API key: ";
+    $apiKey = trim(fgets(STDIN));
+
+    if (empty($apiKey)) {
+        echo "❌ API key cannot be empty\n";
+        return false;
+    }
+
+    // Add to shell profile
+    $homeDir = $_SERVER['HOME'] ?? $_SERVER['USERPROFILE'] ?? '';
+    if (empty($homeDir)) {
+        echo "❌ Could not determine home directory\n";
+        return false;
+    }
+
+    $shellProfile = $homeDir . '/.bashrc';
+    if (file_exists($homeDir . '/.zshrc')) {
+        $shellProfile = $homeDir . '/.zshrc';
+    }
+
+    $exportLine = "export CLAUDE_API_KEY=\"$apiKey\"";
+    file_put_contents($shellProfile, "\n# Claude Git Hook\n$exportLine\n", FILE_APPEND);
+
+    echo "✅ API key configured successfully!\n";
+    echo "Run: source " . basename($shellProfile) . " to apply changes\n";
+
+    return true;
+}
+
+function showHelp()
+{
+    echo "Claude Git Hook CLI\n";
+    echo "==================\n\n";
+    echo "Usage: claude-git-hook <command>\n\n";
+    echo "Commands:\n";
+    echo "  install     Install the git hook\n";
+    echo "  uninstall   Remove the git hook\n";
+    echo "  configure   Set up API key interactively\n";
+    echo "  status      Check hook installation status\n";
+    echo "  debug       Show debug information\n";
+    echo "  help        Show this help message\n\n";
+    echo "Examples:\n";
+    echo "  claude-git-hook install\n";
+    echo "  claude-git-hook configure\n";
+    echo "  claude-git-hook status\n";
+    echo "  claude-git-hook debug\n\n";
+}
+
+function showDebug()
+{
+    echo "🔍 Claude Git Hook Debug Information\n";
+    echo "====================================\n\n";
+    echo "Current working directory: " . getcwd() . "\n";
+    echo "Script location: " . __DIR__ . "\n";
+    echo "PHP binary: " . PHP_BINARY . "\n";
+    echo "PHP version: " . PHP_VERSION . "\n\n";
+
+    echo "Searching for autoload.php in:\n";
+    $autoloadPaths = [
+        __DIR__ . '/../../autoload.php',
+        __DIR__ . '/../../../autoload.php',
+        __DIR__ . '/../vendor/autoload.php',
+        getcwd() . '/vendor/autoload.php',
+        dirname(getcwd()) . '/vendor/autoload.php',
+        dirname(dirname(getcwd())) . '/vendor/autoload.php',
+    ];
+
+    foreach ($autoloadPaths as $path) {
+        $exists = file_exists($path) ? "✅ Found" : "❌ Not found";
+        echo "  $exists: $path\n";
+    }
+
+    echo "\nGit repository check:\n";
+    echo "  .git directory: " . (is_dir('.git') ? "✅ Found" : "❌ Not found") . "\n";
+
+    if (is_dir('.git')) {
+        $hookFile = '.git/hooks/prepare-commit-msg';
+        echo "  Hook file: " . (file_exists($hookFile) ? "✅ Installed" : "❌ Not installed") . "\n";
+        if (file_exists($hookFile)) {
+            echo "  Hook executable: " . (is_executable($hookFile) ? "✅ Yes" : "❌ No") . "\n";
+        }
+    }
+
+    echo "\nEnvironment variables:\n";
+    $apiKey = getenv('CLAUDE_API_KEY');
+    if ($apiKey) {
+        $preview = substr($apiKey, 0, 8) . '...' . substr($apiKey, -4);
+        echo "  CLAUDE_API_KEY: ✅ Set ($preview)\n";
+    } else {
+        echo "  CLAUDE_API_KEY: ❌ Not set\n";
+    }
+}
+
+function checkStatus()
+{
+    echo "🔍 Checking Claude Git Hook status...\n\n";
+
+    // Check if in git repository
+    if (!is_dir('.git')) {
+        echo "❌ Not in a git repository\n";
+        return;
+    }
+
+    // Check if hook exists
+    $hookFile = '.git/hooks/prepare-commit-msg';
+    if (!file_exists($hookFile)) {
+        echo "❌ Hook not installed\n";
+        echo "Run: claude-git-hook install\n";
+        return;
+    }
+
+    echo "✅ Hook installed at: $hookFile\n";
+
+    // Check if executable
+    if (!is_executable($hookFile)) {
+        echo "⚠️  Hook file is not executable\n";
+        chmod($hookFile, 0755);
+        echo "✅ Fixed permissions\n";
+    }
+
+    // Check API key
+    $apiKey = getenv('CLAUDE_API_KEY');
+    if (empty($apiKey)) {
+        echo "⚠️  CLAUDE_API_KEY environment variable not set\n";
+        echo "Run: claude-git-hook configure\n";
+    } else {
+        $keyPreview = substr($apiKey, 0, 8) . '...' . substr($apiKey, -4);
+        echo "✅ API key configured: $keyPreview\n";
+    }
+
+    echo "\n🎯 Ready to use! Try: git add . && git commit\n";
+}
+
+// Main execution
+$command = $argv[1] ?? 'help';
+
+switch ($command) {
+    case 'install':
+        echo "🚀 Installing Claude Git Hook...\n";
+        if (class_exists('ClaudeGitHook\\Installer')) {
+            ClaudeGitHook\Installer::install();
+        } else {
+            simpleInstall();
+        }
+        break;
+
+    case 'uninstall':
+        echo "🗑️  Uninstalling Claude Git Hook...\n";
+        if (class_exists('ClaudeGitHook\\Installer')) {
+            ClaudeGitHook\Installer::uninstall();
+        } else {
+            $hookFile = '.git/hooks/prepare-commit-msg';
+            if (file_exists($hookFile)) {
+                unlink($hookFile);
+                echo "✅ Claude Git Hook uninstalled\n";
+            } else {
+                echo "❌ Hook not found\n";
+            }
+        }
+        break;
+
+    case 'configure':
+        if (class_exists('ClaudeGitHook\\Installer')) {
+            ClaudeGitHook\Installer::configure();
+        } else {
+            simpleConfigure();
+        }
+        break;
+
+    case 'status':
+        checkStatus();
+        break;
+
+    case 'debug':
+        showDebug();
+        break;
+
+    case 'help':
+    case '--help':
+    case '-h':
+        showHelp();
+        break;
+
+    default:
+        echo "❌ Unknown command: $command\n\n";
+        showHelp();
+        exit(1);
+}

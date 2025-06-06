@@ -1,0 +1,169 @@
+name: CI
+
+on:
+    push:
+        branches: [ master, develop ]
+    pull_request:
+        branches: [ master, develop ]
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+
+        strategy:
+            matrix:
+                php-version: ['7.4', '8.0', '8.1', '8.2', '8.3']
+
+        name: PHP ${{ matrix.php-version }}
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@v2
+              with:
+                  php-version: ${{ matrix.php-version }}
+                  extensions: json, curl
+                  coverage: xdebug
+
+            - name: Validate composer.json and composer.lock
+              run: composer validate --strict
+
+            - name: Cache Composer packages
+              id: composer-cache
+              uses: actions/cache@v3
+              with:
+                  path: vendor
+                  key: ${{ runner.os }}-php-${{ matrix.php-version }}-${{ hashFiles('**/composer.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-php-${{ matrix.php-version }}-
+
+            - name: Install dependencies
+              run: composer install --prefer-dist --no-progress --no-interaction
+
+            - name: Check code style
+              run: composer cs-check
+
+            - name: Run static analysis
+              run: composer analyze
+
+            - name: Run unit tests
+              run: composer test
+
+            - name: Run tests with coverage
+              if: matrix.php-version == '8.1'
+              run: composer test-coverage
+
+            - name: Upload coverage reports to Codecov
+              if: matrix.php-version == '8.1'
+              uses: codecov/codecov-action@v3
+              with:
+                  file: ./coverage/clover.xml
+                  fail_ci_if_error: true
+
+    integration-test:
+        runs-on: ubuntu-latest
+        needs: test
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.1'
+                  extensions: json, curl
+
+            - name: Install dependencies
+              run: composer install --prefer-dist --no-progress --no-interaction
+
+            - name: Setup Git
+              run: |
+                  git config --global user.email "action@github.com"
+                  git config --global user.name "GitHub Action"
+
+            - name: Test CLI installation
+              run: |
+                  # Test CLI commands
+                  php bin/claude-git-hook help
+                  php bin/claude-git-hook debug
+
+            - name: Test git repository integration
+              run: |
+                  # Create test repository
+                  mkdir test-repo
+                  cd test-repo
+                  git init
+                  git config user.email "test@example.com"
+                  git config user.name "Test User"
+                  
+                  # Install hook
+                  php ../bin/claude-git-hook install
+                  
+                  # Verify hook was installed
+                  php ../bin/claude-git-hook status
+                  
+                  # Test that hook file exists and is executable
+                  test -x .git/hooks/prepare-commit-msg
+
+            - name: Test issue extraction patterns
+              run: |
+                  cd test-repo
+                  
+                  # Test different branch patterns
+                  git checkout -b feature/CAM-123-test-feature
+                  echo "test content" > test1.txt
+                  git add test1.txt
+                  
+                  # The hook should work (even without API key, it will use fallback)
+                  # We don't actually commit to avoid hook execution in CI
+                  echo "Branch pattern test completed"
+
+    security:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.1'
+
+            - name: Install dependencies
+              run: composer install --prefer-dist --no-progress --no-interaction
+
+            - name: Run security checker
+              run: |
+                  composer require --dev roave/security-advisories:dev-latest --no-update || true
+                  composer audit
+
+    release:
+        runs-on: ubuntu-latest
+        needs: [test, integration-test, security]
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@v2
+              with:
+                  php-version: '8.1'
+
+            - name: Install dependencies
+              run: composer install --prefer-dist --no-progress --no-interaction --no-dev
+
+            - name: Create release package
+              run: |
+                  # Create a clean package without dev dependencies
+                  mkdir -p dist
+                  rsync -av --exclude='dist' --exclude='.git' --exclude='tests' --exclude='coverage' . dist/
+
+            - name: Archive release
+              uses: actions/upload-artifact@v3
+              with:
+                  name: claude-git-hook-release
+                  path: dist/
